@@ -21,11 +21,10 @@ const (
 )
 
 var (
-	nnStyleTitle        = []string{"font-size: 26px;"}
-	nnStyleSubTitle     = []string{"font-size: 18px;"}
-	nnStyleCommentBlock = []string{"background: #e6e6e6;"}
-	nnStyleSectionBlock = []string{"text-align: left;"}
-	nnStyleSectionText  = []string{"color: rgb(0, 0, 0);"}
+	nnStyleTitle           = []string{"font-size: 26px;"}
+	nnStyleSubTitle        = []string{"font-size: 18px;"}
+	nnStyleCommentBlock    = []string{"background: #e6e6e6;"}
+	nnStyleCommentSubTitle = []string{"font-weight: bold;"}
 )
 
 type newneek struct {
@@ -66,12 +65,12 @@ func checkStyle(style string, compare []string) bool {
 	return ok
 }
 
-func getBlockType(selection *goquery.Selection) nnBLockType {
+func getBlockType(selection *goquery.Selection) (nnBLockType, string) {
 	blockStyle := selection.AttrOr("style", "")
 
 	// check if its comment block
 	if checkStyle(blockStyle, nnStyleCommentBlock) {
-		return nnBlockComment
+		return nnBlockComment, ""
 	}
 
 	// check if its title/contents block
@@ -89,34 +88,44 @@ func getBlockType(selection *goquery.Selection) nnBLockType {
 
 	if title != "" {
 		if strings.Contains(title, "10분 더 있다면 읽어 볼 거리") {
-			return nnBlock10Min
+			return nnBlock10Min, title
 		}
-		return nnBlockTitle
+		return nnBlockTitle, title
 	}
 
 	if subTitle != "" {
-		return nnBlockContents
+		return nnBlockContents, ""
 	}
-	return nnBlockNothing
+	return nnBlockNothing, ""
+}
+
+type blockInfo struct {
+	blockType nnBLockType
+	blockData string
 }
 
 func (nn *newneek) Parse() ([]byte, error) {
-	blockIndex := &sepIdxArr{index: 0}
+	var blockIndex []blockInfo
 	blocks := nn.docs[len(nn.docs)-1].Find(".stb-block")
 	blocks.Each(
 		func(i int, block *goquery.Selection) {
-			blockType := getBlockType(block)
-			blockIndex.array = append(blockIndex.array, string(blockType))
-			blockIndex.index = i
+			blockType, blockData := getBlockType(block)
+			blockIndex = append(blockIndex, blockInfo{blockType, blockData})
 
 			switch blockType {
 			case nnBlockTitle:
 				nn.parseBlockTitle(block, i)
 			case nnBlockContents:
-				if blockIndex.array[i-1] == string(nnBlock10Min) {
+				// previous block type
+				prevBlock := blockIndex[i-1]
+				if prevBlock.blockType == nnBlock10Min {
 					return
 				}
-				nn.parseBlockContents(block, i)
+				if prevBlock.blockType != nnBlockTitle {
+					nn.log.Error(prevBlock.blockType)
+					return
+				}
+				nn.parseBlockContents(prevBlock.blockData, block, i)
 			case nnBlockComment:
 				if i == len(blocks.Nodes)-2 {
 					return
@@ -128,6 +137,10 @@ func (nn *newneek) Parse() ([]byte, error) {
 				nn.parseBlockComment(block, i)
 			case nnBlock10Min:
 			default:
+				nn.log.WithFields(log.Fields{
+					"block": i,
+					"type":  "nothing",
+				}).Debug("block nothing")
 			}
 		})
 
@@ -145,17 +158,19 @@ func (nn *newneek) parseBlockTitle(
 				title += span.Text()
 			}
 		})
-	nn.log.WithFields(log.Fields{
-		"block": blockIndex,
-		"type":  "title",
-	}).Debug(title)
 	return
 }
 
+type contentsInfo struct {
+	title    string
+	contents string
+}
+
 func (nn *newneek) parseBlockContents(
+	title string,
 	block *goquery.Selection,
 	blockIndex int,
-) (subtitle string, contents map[string]interface{}) {
+) (subtitle string, contents []contentsInfo) {
 	var contentsBuilder strings.Builder
 
 	subTitle := &sepIdxArr{index: 0}
@@ -169,15 +184,45 @@ func (nn *newneek) parseBlockContents(
 	box.Each(
 		func(boxIndex int, boxContents *goquery.Selection) {
 			// get full contents
-			if goquery.NodeName(boxContents) == "span" {
+			boxContentsTagName := goquery.NodeName(boxContents)
+			switch boxContentsTagName {
+			case "span":
+				fallthrough
+			case "div":
+				fallthrough
+			case "ul":
 				contentsBuilder.WriteString(boxContents.Text())
 			}
 			boxContents.Children().Each(
 				nn.parseBlockContentsElement(boxContents, subTitle))
 		})
 
+	contentsText := contentsBuilder.String()
+	contents = append(contents, contentsInfo{
+		title:    title,
+		contents: strings.Split(contentsText, subTitle.array[0])[0],
+	})
+
 	for index, sub := range subTitle.array {
-		nn.log.Debug(sub, index)
+		info := contentsInfo{title: sub}
+		if index == len(subTitle.array)-1 {
+			info.contents = strings.Split(contentsText, sub)[1]
+		} else {
+			info.contents = strings.Split(
+				strings.Split(contentsText, sub)[1],
+				subTitle.array[index+1],
+			)[0]
+		}
+		contents = append(contents, info)
+	}
+
+	for _, c := range contents {
+		nn.log.WithFields(log.Fields{
+			"type": "title",
+		}).Info(c.title)
+		nn.log.WithFields(log.Fields{
+			"type": "contents",
+		}).Debug(c.contents)
 	}
 	return
 }
@@ -225,5 +270,12 @@ func (nn *newneek) parseBlockComment(
 	block *goquery.Selection,
 	blockIndex int,
 ) (subtitle string, contents map[string]interface{}) {
+	block.Find(".stb-text-box").Each(
+		func(i int, textBox *goquery.Selection) {
+			textBox.Children().Each(
+				func(i int, selection *goquery.Selection) {
+					nn.log.Debug(goquery.NodeName(selection))
+				})
+		})
 	return
 }
